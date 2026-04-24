@@ -2,7 +2,7 @@
 
 # FACH — Frequency-domain Adversarial Cross-modal Hashing
 
-Reproduction of the paper:
+Code of the paper:
 > **Frequency-Domain Adversarial Robustness Evaluation for Deep Cross-Modal Hashing Systems**
 
 ---
