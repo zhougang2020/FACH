@@ -1,22 +1,16 @@
 """
-Train the FACH substitute model using pre-trained teacher models.
+Train the FACH substitute model (Phase 1).
 
-The substitute model (ImgNet + TxtNet) is trained with:
-  Phase 1 loss = L_align  (JSD between frequency sensitivities, Eq. 13)
-               + L_ME     (margin-enhanced hash-boundary loss, Eq. 14)
-
-When no teacher checkpoints are given, the model falls back to
-self-supervised training with cross-modal hash loss + L_ME.
+Key differences from initial version (aligned with paper):
+  1. TextNet is pre-trained first using cross-modal hash loss, then frozen.
+  2. Learnable teacher weight vector W (Eq. 9) trained jointly with ImgNet.
+  3. Training set size: FLICKR-25K=5000, NUS-WIDE=10500 (paper Table I).
+  4. margin m=1 (paper Sec. IV-B-3).
+  5. 12 teachers: DADH × 6 backbones + UCCH × 6 backbones.
 
 Usage:
-    # With teachers:
-    python train_substitute.py \\
-        --dataset mirflickr25k --bit 64 --device cuda:0 \\
-        --teachers DADH_VGG11,DCMH_RN50,DGCPN_RN152,UCCH_DN161 \\
+    python train_substitute.py --dataset mirflickr25k --bit 64 --device cuda:0 \\
         --teacher_dir ./checkpoints/teachers
-
-    # Without teachers (self-supervised):
-    python train_substitute.py --dataset mirflickr25k --bit 64
 
 Checkpoints saved to:
     checkpoints/substitute/<dataset>_<bit>/ImgNet.pth
@@ -27,37 +21,49 @@ import os
 import math
 import argparse
 import torch
-import torch.nn.functional as F
+import torch.nn as nn
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from datasets import load_data, Dataset
 from models import ImgNet, TxtNet
-from methods.base import HashNet
 from frequency import dct_2d, get_low_freq_mask, compute_sensitivity, compute_consensus_sensitivity
-from losses import distillation_loss, margin_enhanced_loss, lt2_margin
+from losses import (
+    distillation_loss, margin_enhanced_loss, standard_hash_loss,
+    lt1_triplet, lt2_margin, lt3_sign, lt4_contrastive,
+)
 from utils import calc_map_k
-from backbones import BACKBONE_NAMES
+from teacher_loader import load_teachers, compute_consensus_code, TeacherWeights
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Dataset config presets
+# Dataset config presets  (paper Table I)
 # ──────────────────────────────────────────────────────────────────────────────
 
 DATASET_CFG = {
     'mirflickr25k': dict(
-        query_size=2000, db_size=18015, training_size=10000,
+        query_size=2000, db_size=18015, training_size=5000,
         num_label=24, text_dim=1386, image_dim=4096,
     ),
     'nus_wide_tc10': dict(
-        query_size=2100, db_size=184477, training_size=10500,
-        num_label=10, text_dim=1000, image_dim=4096,
+        query_size=2100, db_size=193734, training_size=10500,
+        num_label=21, text_dim=1000, image_dim=4096,
+    ),
+    'mscoco': dict(
+        query_size=2000, db_size=121287, training_size=10000,
+        num_label=80, text_dim=1024, image_dim=4096,
     ),
 }
 
+# 12 teacher tags used in paper (DADH + UCCH, each × 6 backbones)
+TEACHER_TAGS = [
+    'DADH_AlexNet', 'DADH_VGG11', 'DADH_RN50', 'DADH_RN152', 'DADH_IncV3', 'DADH_DN161',
+    'UCCH_AlexNet', 'UCCH_VGG11', 'UCCH_RN50', 'UCCH_RN152', 'UCCH_IncV3', 'UCCH_DN161',
+]
+
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Feature ↔ 2D helpers for DCT
+# Feature ↔ 2D helpers
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _get_side(D: int) -> int:
@@ -77,43 +83,23 @@ def _2d_to_feat(x_2d: torch.Tensor, D: int) -> torch.Tensor:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Teacher loading
+# Teacher loading helper
 # ──────────────────────────────────────────────────────────────────────────────
 
-def load_teacher(tag: str, bit: int, text_dim: int, hidden_dim: int,
-                 teacher_dir: str, dataset: str, device) -> HashNet:
+def _build_teacher_configs(teacher_dir: str, dataset: str, bit: int,
+                            text_dim: int) -> list:
     """
-    Load a pre-trained HashNet teacher from checkpoint.
-
-    tag format: '<METHOD>_<BACKBONE>'  e.g. 'DADH_VGG11', 'DCMH_RN50'
-    Checkpoint path: <teacher_dir>/<METHOD>/<METHOD>_<BACKBONE>_<BIT>.pth
+    Build teacher_configs list from teacher_dir.
+    Looks for files: <teacher_dir>/<METHOD>/<METHOD>_<BACKBONE>_<BIT>_<DATASET>.pth
     """
-    parts = tag.rsplit('_', 1)
-    if len(parts) != 2:
-        raise ValueError(
-            f"Invalid teacher tag '{tag}'. Expected '<METHOD>_<BACKBONE>'.")
-    method, backbone = parts
-    if backbone not in BACKBONE_NAMES:
-        raise ValueError(f"Unknown backbone '{backbone}' in tag '{tag}'.")
-
-    ckpt_path = os.path.join(teacher_dir, method,
-                             f'{method}_{backbone}_{bit}_{dataset}.pth')
-    if not os.path.exists(ckpt_path):
-        raise FileNotFoundError(
-            f"Teacher checkpoint not found: {ckpt_path}\n"
-            f"Train it first with:\n"
-            f"  python train_teacher.py --method {method} --backbone {backbone} "
-            f"--bit {bit} --dataset {dataset}")
-
-    teacher = HashNet(backbone_name=backbone, bit=bit,
-                      text_dim=text_dim, hidden_dim=hidden_dim,
-                      pretrained=False).to(device)
-    teacher.load(ckpt_path, device=device)
-    teacher.eval()
-    for p in teacher.parameters():
-        p.requires_grad_(False)
-    print(f'  [teacher] Loaded {tag}  from  {ckpt_path}')
-    return teacher
+    configs = []
+    for tag in TEACHER_TAGS:
+        method, backbone = tag.split('_', 1)
+        fname = f'{method}_{backbone}_{bit}_{dataset}.pth'
+        ckpt_path = os.path.join(teacher_dir, method, fname)
+        overrides = {'text_dim': text_dim, 'feat_dim': 4096}
+        configs.append({'type': method, 'ckpt_path': ckpt_path, 'overrides': overrides})
+    return configs
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -152,6 +138,50 @@ def evaluate(img_net, txt_net, images, tags, labels, cfg, device):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
+# Phase 0: Pre-train TextNet  (paper Sec. IV-B-3)
+# ──────────────────────────────────────────────────────────────────────────────
+
+def pretrain_txtnet(txt_net, img_net_frozen, train_dl, cfg, device,
+                    pretrain_epochs: int = 5):
+    """
+    Pre-train TextNet using cross-modal hash loss (Eq. 2 in paper).
+    img_net_frozen provides pseudo image codes as supervision.
+    """
+    print("\n[Phase 0] Pre-training TextNet ...")
+    optimizer = torch.optim.Adam(txt_net.parameters(), lr=cfg.lr)
+    txt_net.train()
+    img_net_frozen.eval()
+
+    for epoch in range(pretrain_epochs):
+        epoch_loss = 0.0
+        for idx, imgs, txts, lbls in tqdm(train_dl,
+                                           desc=f'  TxtNet pretrain {epoch+1}/{pretrain_epochs}',
+                                           leave=False):
+            imgs = imgs.to(device).float()
+            txts = txts.to(device).float()
+            lbls = lbls.to(device).float()
+
+            with torch.no_grad():
+                h_img = img_net_frozen(imgs)
+
+            h_txt = txt_net(txts)
+            S = (lbls.mm(lbls.t()) > 0).float()
+            loss = standard_hash_loss(h_img, h_txt, S)
+
+            optimizer.zero_grad()
+            loss.backward()
+            optimizer.step()
+            epoch_loss += loss.item()
+
+        print(f'  TxtNet pretrain epoch {epoch+1}  loss={epoch_loss:.4f}')
+
+    print("[Phase 0] TextNet pre-training done. Freezing TextNet.\n")
+    for p in txt_net.parameters():
+        p.requires_grad_(False)
+    txt_net.eval()
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 # Main
 # ──────────────────────────────────────────────────────────────────────────────
 
@@ -162,18 +192,18 @@ def main():
                         choices=list(DATASET_CFG.keys()))
     parser.add_argument('--bit',        type=int, default=64)
     parser.add_argument('--epochs',     type=int, default=20)
+    parser.add_argument('--pretrain_epochs', type=int, default=5,
+                        help='Epochs to pre-train TextNet before freezing.')
     parser.add_argument('--batch_size', type=int, default=64)
     parser.add_argument('--lr',         type=float, default=1e-4)
     parser.add_argument('--hidden_dim', type=int, default=4096)
-    parser.add_argument('--margin',     type=float, default=1.5,
-                        help='Boundary margin m in L_ME.')
-    parser.add_argument('--tau_freq',   type=int, default=20,
-                        help='Low-frequency threshold τ for DCT mask.')
-    parser.add_argument('--teachers',   type=str, default='',
-                        help='Comma-separated teacher tags: DADH_VGG11,DCMH_RN50,…')
+    parser.add_argument('--margin',     type=float, default=1.0,
+                        help='Boundary margin m in L_ME (paper: m=1).')
+    parser.add_argument('--tau_freq',   type=int, default=20)
+    parser.add_argument('--sensitivity_loss', type=str, default='lt2',
+                        choices=['lt1', 'lt2', 'lt3', 'lt4'])
     parser.add_argument('--teacher_dir', type=str,
-                        default='./checkpoints/teachers',
-                        help='Directory containing teacher checkpoints.')
+                        default='./checkpoints/teachers')
     parser.add_argument('--save_dir',   type=str,
                         default='./checkpoints/substitute')
     parser.add_argument('--device',     type=str, default='cuda:0')
@@ -187,7 +217,7 @@ def main():
     print(f"\n{'='*60}")
     print(f"  Training FACH substitute model")
     print(f"  Dataset: {cfg.dataset}  |  Bit: {cfg.bit}")
-    print(f"  Device:  {device}")
+    print(f"  Train size: {cfg.training_size}  |  Device: {device}")
     print(f"{'='*60}\n")
 
     # ── Load data ─────────────────────────────────────────────────────────────
@@ -197,43 +227,57 @@ def main():
     train_dl = DataLoader(train_ds, batch_size=cfg.batch_size,
                           shuffle=True, num_workers=0, drop_last=False)
 
-    # ── Substitute model ──────────────────────────────────────────────────────
+    # ── Build models ──────────────────────────────────────────────────────────
     img_net = ImgNet(
-        bit=cfg.bit, image_dim=cfg.image_dim,
-        hidden_dim=cfg.hidden_dim,
+        bit=cfg.bit, image_dim=cfg.image_dim, hidden_dim=cfg.hidden_dim,
     ).to(device)
     txt_net = TxtNet(
-        bit=cfg.bit, text_dim=cfg.text_dim,
-        hidden_dim=cfg.hidden_dim,
+        bit=cfg.bit, text_dim=cfg.text_dim, hidden_dim=cfg.hidden_dim,
     ).to(device)
-    optimizer = torch.optim.Adam(
-        list(img_net.parameters()) + list(txt_net.parameters()), lr=cfg.lr)
 
-    # ── Teacher models ────────────────────────────────────────────────────────
-    teacher_tags = [t.strip() for t in cfg.teachers.split(',') if t.strip()]
-    teachers = []
-    for tag in teacher_tags:
-        t = load_teacher(tag, cfg.bit, cfg.text_dim, cfg.hidden_dim,
-                         cfg.teacher_dir, cfg.dataset, device)
-        teachers.append(t)
+    # ── Load teachers ─────────────────────────────────────────────────────────
+    teacher_configs = _build_teacher_configs(
+        cfg.teacher_dir, cfg.dataset, cfg.bit, cfg.text_dim)
+    teachers = load_teachers(teacher_configs, cfg.bit, device)
     have_teachers = len(teachers) > 0
-    print(f"\nTeachers loaded: {len(teachers)}")
+    print(f"\nTeachers loaded: {len(teachers)} / {len(TEACHER_TAGS)}")
 
-    # ── Frequency setup ───────────────────────────────────────────────────────
+    # Learnable teacher weight vector W (Eq. 9)
+    teacher_weights = None
+    if have_teachers:
+        teacher_weights = TeacherWeights(len(teachers)).to(device)
+
+    # ── Phase 0: Pre-train TextNet ────────────────────────────────────────────
+    pretrain_txtnet(txt_net, img_net, train_dl, cfg, device,
+                    pretrain_epochs=cfg.pretrain_epochs)
+
+    # ── Phase 1: Train ImgNet (+ W) ───────────────────────────────────────────
+    params = list(img_net.parameters())
+    if teacher_weights is not None:
+        params += list(teacher_weights.parameters())
+    optimizer = torch.optim.Adam(params, lr=cfg.lr)
+
+    # Frequency setup
     side = _get_side(cfg.image_dim)
     mask = get_low_freq_mask(side, side, cfg.tau_freq, device)
 
-    loss_fn_global = lambda h: lt2_margin(h, m=cfg.margin)
+    def _make_loss_fn(variant, lbls=None):
+        if variant == 'lt1':
+            return lambda h: lt1_triplet(h, lbls)
+        elif variant == 'lt2':
+            return lambda h: lt2_margin(h, m=cfg.margin)
+        elif variant == 'lt3':
+            return lambda h: lt3_sign(h)
+        elif variant == 'lt4':
+            return lambda h: lt4_contrastive(h, lbls)
+        raise ValueError(f"Unknown sensitivity_loss: {variant}")
 
-    # ── Checkpoint path ───────────────────────────────────────────────────────
     ckpt_dir = os.path.join(cfg.save_dir, f'{cfg.dataset}_{cfg.bit}')
     os.makedirs(ckpt_dir, exist_ok=True)
-
     best_avg = 0.0
 
-    # ──────────────────────────────────────────────────────────────────────────
     for epoch in range(cfg.epochs):
-        img_net.train(); txt_net.train()
+        img_net.train()
         epoch_loss = 0.0
 
         for idx, imgs, txts, lbls in tqdm(train_dl,
@@ -243,7 +287,7 @@ def main():
             lbls = lbls.to(device).float()
 
             h_img = img_net(imgs)
-            h_txt = txt_net(txts)
+            loss_fn = _make_loss_fn(cfg.sensitivity_loss, lbls)
 
             if have_teachers:
                 # ── Distillation with teachers ────────────────────────────────
@@ -251,48 +295,41 @@ def main():
                 with torch.no_grad():
                     F_imgs = dct_2d(imgs_2d)
 
-                # Substitute sensitivity A_s
                 def sub_fn(x_sp):
                     return img_net(_2d_to_feat(x_sp, cfg.image_dim))
 
-                A_s = compute_sensitivity(sub_fn, F_imgs, mask, loss_fn_global)
+                A_s = compute_sensitivity(sub_fn, F_imgs, mask, loss_fn)
 
-                # Teacher sensitivity functions
                 def _make_t_fn(teacher):
                     def fn(x_sp):
-                        return teacher.forward_img(_2d_to_feat(x_sp, cfg.image_dim))
+                        return teacher(_2d_to_feat(x_sp, cfg.image_dim))
                     return fn
 
                 teacher_fns = [_make_t_fn(t) for t in teachers]
+                W = teacher_weights() if teacher_weights is not None else None
                 A_c = compute_consensus_sensitivity(
-                    teacher_fns, F_imgs, mask, loss_fn_global)
+                    teacher_fns, F_imgs, mask, loss_fn, weights=W)
 
-                # Consensus target codes t for L_ME  (Eq. 14)
                 with torch.no_grad():
-                    h_stack = torch.stack(
-                        [t.forward_img(imgs) for t in teachers], dim=0)
-                    t_code  = h_stack.mean(dim=0).sign()   # (B, K)
+                    t_code = compute_consensus_code(teachers, imgs)
 
                 loss_img = distillation_loss(A_s, A_c, h_img, t_code, cfg.margin)
-                loss_txt = margin_enhanced_loss(h_txt, t_code, cfg.margin)
-                total_loss = loss_img + loss_txt
 
             else:
                 # ── Self-supervised fallback ───────────────────────────────────
                 t_code = h_img.detach().sign()
                 loss_img = margin_enhanced_loss(h_img, t_code, cfg.margin)
-                loss_txt = margin_enhanced_loss(h_txt, t_code, cfg.margin)
 
-                # Cross-modal pairwise hash loss
-                inner = 0.5 * h_img.mm(h_txt.t())
-                S     = (lbls.mm(lbls.t()) > 0).float()
-                hash_loss = -(S * inner - torch.log(1 + torch.exp(inner))).mean()
-                total_loss = loss_img + loss_txt + hash_loss
+                # Cross-modal hash loss with frozen TxtNet
+                with torch.no_grad():
+                    h_txt = txt_net(txts)
+                S = (lbls.mm(lbls.t()) > 0).float()
+                loss_img = loss_img + standard_hash_loss(h_img, h_txt, S)
 
             optimizer.zero_grad()
-            total_loss.backward()
+            loss_img.backward()
             optimizer.step()
-            epoch_loss += total_loss.item()
+            epoch_loss += loss_img.item()
 
         print(f'Epoch {epoch+1:3d}  loss={epoch_loss:.4f}')
 
@@ -307,7 +344,10 @@ def main():
                            os.path.join(ckpt_dir, 'ImgNet.pth'))
                 torch.save(txt_net.state_dict(),
                            os.path.join(ckpt_dir, 'TxtNet.pth'))
-                print(f'  ✓ Saved  (avg={best_avg:.4f})  → {ckpt_dir}')
+                if teacher_weights is not None:
+                    torch.save(teacher_weights.state_dict(),
+                               os.path.join(ckpt_dir, 'TeacherWeights.pth'))
+                print(f'  Saved (avg={best_avg:.4f}) → {ckpt_dir}')
 
     print(f'\nDone. Best avg MAP = {best_avg:.4f}')
     print(f'Weights: {ckpt_dir}')

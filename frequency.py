@@ -2,11 +2,11 @@
 Differentiable 2D DCT / IDCT utilities for FACH.
 
 All transforms are implemented via FFT so gradients flow through them
-during PyTorch autograd (used for frequency-sensitivity computation and
-PGD in the frequency domain).
+during PyTorch autograd.
 
-Reference DCT-II definition used here (unnormalised):
-  X[k] = 2 * sum_{n=0}^{N-1} x[n] * cos(pi*k*(2n+1) / (2N))
+Key additions vs initial version:
+  - compute_consensus_sensitivity now supports a learnable weight vector W
+    (Eq. 9 in paper: Ac = (1/M) * sum_m W^T * A_Tm)
 """
 
 import numpy as np
@@ -24,16 +24,12 @@ def dct_1d(x: torch.Tensor) -> torch.Tensor:
     N = x_shape[-1]
     x = x.reshape(-1, N)
 
-    # Reorder: even indices first, then reversed odd indices
     v = torch.cat([x[:, ::2], x[:, 1::2].flip(1)], dim=1)
-
-    # FFT then phase-shift to get DCT coefficients
     Vc = torch.fft.fft(v, dim=1)
     k = -torch.arange(N, dtype=x.dtype, device=x.device).unsqueeze(0) * (np.pi / (2 * N))
     W_r = torch.cos(k)
     W_i = torch.sin(k)
     V = Vc.real * W_r - Vc.imag * W_i
-
     return (2 * V).reshape(x_shape)
 
 
@@ -59,38 +55,35 @@ def idct_1d(X: torch.Tensor) -> torch.Tensor:
     x = v.new_zeros(v.shape)
     x[:, ::2] = v[:, : N - N // 2]
     x[:, 1::2] = v.flip(1)[:, : N // 2]
-
     return x.reshape(x_shape)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# 2-D DCT / IDCT  (applied to last two dimensions)
+# 2-D DCT / IDCT
 # ──────────────────────────────────────────────────────────────────────────────
 
 def dct_2d(x: torch.Tensor) -> torch.Tensor:
-    """2-D DCT: apply 1-D DCT along rows then along columns."""
-    # along last dim (cols)
+    """2-D DCT: apply 1-D DCT along rows then columns."""
     X = dct_1d(x)
-    # along second-to-last dim (rows)
     X = dct_1d(X.transpose(-1, -2)).transpose(-1, -2)
     return X
 
 
 def idct_2d(X: torch.Tensor) -> torch.Tensor:
-    """2-D IDCT: apply 1-D IDCT along columns then along rows."""
+    """2-D IDCT: apply 1-D IDCT along columns then rows."""
     x = idct_1d(X.transpose(-1, -2)).transpose(-1, -2)
     x = idct_1d(x)
     return x
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Low-frequency mask
+# Low-frequency mask  (Eq. 7)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def get_low_freq_mask(h: int, w: int, tau: int, device: torch.device) -> torch.Tensor:
     """
-    Binary mask M_low(u,v) = 1 when 0 <= u,v <= tau, else 0.
-    Returned shape: (h, w).  (Eq. 10 in the paper.)
+    M_low(u,v) = 1 if 0 <= u,v <= tau, else 0.
+    Returns (h, w).
     """
     tau = min(tau, h - 1, w - 1)
     mask = torch.zeros(h, w, device=device)
@@ -99,7 +92,7 @@ def get_low_freq_mask(h: int, w: int, tau: int, device: torch.device) -> torch.T
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Sensitivity map
+# Sensitivity map  (Eqs. 5-6)
 # ──────────────────────────────────────────────────────────────────────────────
 
 def compute_sensitivity(
@@ -109,33 +102,24 @@ def compute_sensitivity(
     loss_fn,
 ) -> torch.Tensor:
     """
-    Compute the frequency-domain sensitivity map A(u,v) (Eqs. 8-9).
-
-    A(u,v) = |∂ L_t(model(IDCT(F))) / ∂ F(u,v)| ⊙ M_low
+    A(u,v) = |∂ Lt(model(IDCT(F))) / ∂ F(u,v)| ⊙ M_low
 
     Args:
-        model_fn : callable (x_spatial -> hash_real) — no sign applied.
-        F_freq   : (B, C, H, W) frequency representation (requires_grad NOT set here).
+        model_fn : callable (x_spatial -> hash_real).
+        F_freq   : (B, C, H, W) frequency representation.
         mask     : (H, W) low-frequency mask.
         loss_fn  : callable (hash_real -> scalar loss).
 
     Returns:
-        sensitivity: (B, C, H, W) masked absolute gradients, averaged over batch.
+        sensitivity: (B, C, H, W) masked absolute gradients.
     """
     F_tmp = F_freq.detach().requires_grad_(True)
-
-    # Reconstruct spatial image from frequency representation
-    x_spatial = idct_2d(F_tmp)  # (B, C, H, W)
-
-    # Forward through model
+    x_spatial = idct_2d(F_tmp)
     h = model_fn(x_spatial)
-
-    # Scalar loss
     loss = loss_fn(h)
     loss.backward()
 
-    grad = F_tmp.grad  # (B, C, H, W)
-    # Mask to low-frequency region (broadcast C dimension)
+    grad = F_tmp.grad
     sensitivity = grad.abs() * mask.unsqueeze(0).unsqueeze(0)
     return sensitivity.detach()
 
@@ -148,11 +132,22 @@ def compute_consensus_sensitivity(
     weights: torch.Tensor = None,
 ) -> torch.Tensor:
     """
-    Compute the consensus sensitivity matrix A_c (Eq. 12).
+    Consensus sensitivity matrix Ac (Eq. 9):
+        Ac = (1/M) * sum_m  W_m * A_{T_m}
 
-    A_c = (1/M) * sum_m  w_m * A_{T_m}
-
+    W is a learnable scalar weight per teacher (projected via W^T).
     If weights is None, uniform averaging is used.
+
+    Args:
+        teacher_fns : list of callables (x_spatial -> hash_real).
+        F_freq      : (B, C, H, W) frequency representation.
+        mask        : (H, W) low-frequency mask.
+        loss_fn     : callable (hash_real -> scalar loss).
+        weights     : (M,) tensor of scalar importance scores (W^T A_Tm).
+                      If None, uniform 1/M weights are used.
+
+    Returns:
+        A_c : (B, C, H, W)
     """
     M = len(teacher_fns)
     if M == 0:
@@ -160,6 +155,9 @@ def compute_consensus_sensitivity(
 
     if weights is None:
         weights = torch.ones(M, device=F_freq.device) / M
+    else:
+        # Normalise so weights sum to 1 (softmax-style, keeps scale stable)
+        weights = F.softmax(weights, dim=0)
 
     A_c = None
     for m, teacher_fn in enumerate(teacher_fns):

@@ -1,29 +1,49 @@
 """
 Teacher model loader for FACH.
 
-Supports loading pre-trained victim models from the sibling directories
-(DADH, DCMH, DGCPN, UCCH) and wrapping them in a unified callable interface.
+Paper uses 12 teacher models:
+  - DADH × 6 backbones (AlexNet, VGG11, RN50, RN152, Inc-v3, DN161)
+  - UCCH × 6 backbones (AlexNet, VGG11, RN50, RN152, Inc-v3, DN161)
 
-Each teacher callable:   x_features (B, D) → h_real (B, K)
+Each teacher callable:  x_features (B, D) → h_real (B, K)
 
-Usage example:
-    from teacher_loader import load_teachers
-    teachers = load_teachers(opt.teacher_configs, opt.bit, opt.device)
-    # teachers is a list of callables
+Checkpoint naming convention:
+  checkpoints/teachers/<METHOD>/<METHOD>_<BACKBONE>_<BIT>_<DATASET>.pth
+
+For DADH: the GEN model's image branch is used.
+For UCCH: the UCCHHashNet image branch is used.
 """
 
 import os
 import sys
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Learnable teacher weight vector W  (Eq. 9)
+# ──────────────────────────────────────────────────────────────────────────────
+
+class TeacherWeights(nn.Module):
+    """
+    Learnable scalar importance weight per teacher (W^T in Eq. 9).
+    Initialised to uniform; trained jointly with the substitute model.
+    """
+    def __init__(self, num_teachers: int):
+        super().__init__()
+        self.w = nn.Parameter(torch.ones(num_teachers))
+
+    def forward(self) -> torch.Tensor:
+        """Returns softmax-normalised weights (M,)."""
+        return F.softmax(self.w, dim=0)
+
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Generic wrapper
 # ──────────────────────────────────────────────────────────────────────────────
 
 class TeacherWrapper(nn.Module):
-    """Wraps an existing model so it exposes a unified forward(x) → h_real."""
-
     def __init__(self, model, forward_fn):
         super().__init__()
         self.model = model
@@ -34,82 +54,79 @@ class TeacherWrapper(nn.Module):
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Per-method loaders
+# DADH loader
 # ──────────────────────────────────────────────────────────────────────────────
 
 def _load_dadh(ckpt_path: str, bit: int, opt_overrides: dict, device):
-    """Load a pre-trained DADH generator as a teacher."""
+    """
+    Load DADH GEN model image branch as teacher.
+    Expects checkpoint at ckpt_path (full path to .pth file).
+    """
     base_dir = os.path.join(os.path.dirname(__file__), '..', 'DADH')
     sys.path.insert(0, os.path.abspath(base_dir))
     try:
         from models.gen_model import GEN
-        import scipy.io as scio
 
-        # Minimal config compatible with DADH
-        class _Opt:
-            dropout   = False
-            image_dim = opt_overrides.get('image_dim', 4096)
-            text_dim  = opt_overrides.get('text_dim', 1386)
-            hidden_dim = opt_overrides.get('hidden_dim', 8192)
+        image_dim  = opt_overrides.get('image_dim', 4096)
+        text_dim   = opt_overrides.get('text_dim', 1386)
+        hidden_dim = opt_overrides.get('hidden_dim', 8192)
 
-        pretrain = None
         model = GEN(
-            _Opt.dropout, _Opt.image_dim, _Opt.text_dim,
-            _Opt.hidden_dim, bit, pretrain_model=pretrain,
+            dropout=False,
+            image_dim=image_dim,
+            text_dim=text_dim,
+            hidden_dim=hidden_dim,
+            output_dim=bit,
+            pretrain_model=None,
         ).to(device)
 
-        state = torch.load(os.path.join(ckpt_path, 'GEN.pth'), map_location=device)
+        state = torch.load(ckpt_path, map_location=device)
         model.load_state_dict(state)
         model.eval()
+        for p in model.parameters():
+            p.requires_grad_(False)
 
         def fwd(m, x):
-            h_i, _, _, _ = m(x, torch.zeros(x.shape[0], _Opt.text_dim, device=x.device))
-            return h_i
+            # GEN.forward returns (x_code, y_code, f_x, f_y)
+            x_code, _, _, _ = m(x, torch.zeros(x.shape[0], text_dim, device=x.device))
+            return x_code
 
         return TeacherWrapper(model, fwd)
     finally:
         sys.path.pop(0)
 
 
-def _load_dcmh(ckpt_path: str, bit: int, opt_overrides: dict, device):
-    """Load a pre-trained DCMH image module as a teacher."""
-    base_dir = os.path.join(os.path.dirname(__file__), '..', 'DCMH')
-    sys.path.insert(0, os.path.abspath(base_dir))
-    try:
-        from models.img_module import ImgModule
-
-        model = ImgModule(bit).to(device)
-        model.load(os.path.join(ckpt_path, 'ImgModule.pth'))
-        model.eval()
-
-        def fwd(m, x):
-            return m(x)
-
-        return TeacherWrapper(model, fwd)
-    finally:
-        sys.path.pop(0)
-
+# ──────────────────────────────────────────────────────────────────────────────
+# UCCH loader
+# ──────────────────────────────────────────────────────────────────────────────
 
 def _load_ucch(ckpt_path: str, bit: int, opt_overrides: dict, device):
-    """Load a pre-trained UCCH image network as a teacher."""
-    base_dir = os.path.join(os.path.dirname(__file__), '..', 'UCCH')
-    sys.path.insert(0, os.path.abspath(base_dir))
-    try:
-        from nets.img_net import ImgNet
+    """
+    Load UCCH UCCHHashNet image branch as teacher.
+    Expects checkpoint at ckpt_path (full path to .pth file).
+    """
+    from methods.UCCH import UCCHHashNet
 
-        image_dim = opt_overrides.get('image_dim', 4096)
-        model = ImgNet(bit, image_dim).to(device)
-        state = torch.load(os.path.join(ckpt_path, 'ImgNet.pth'), map_location=device)
-        model.load_state_dict(state)
-        model.eval()
+    feat_dim = opt_overrides.get('feat_dim', 4096)
+    text_dim = opt_overrides.get('text_dim', 1386)
 
-        def fwd(m, x):
-            h, _ = m(x)
-            return h
+    model = UCCHHashNet(
+        bit=bit,
+        text_dim=text_dim,
+        feat_dim=feat_dim,
+        backbone_name=None,   # feature mode
+    ).to(device)
 
-        return TeacherWrapper(model, fwd)
-    finally:
-        sys.path.pop(0)
+    state = torch.load(ckpt_path, map_location=device)
+    model.load_state_dict(state)
+    model.eval()
+    for p in model.parameters():
+        p.requires_grad_(False)
+
+    def fwd(m, x):
+        return m.forward_img(x)
+
+    return TeacherWrapper(model, fwd)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -118,7 +135,6 @@ def _load_ucch(ckpt_path: str, bit: int, opt_overrides: dict, device):
 
 _LOADERS = {
     'DADH': _load_dadh,
-    'DCMH': _load_dcmh,
     'UCCH': _load_ucch,
 }
 
@@ -128,13 +144,13 @@ def load_teachers(teacher_configs: list, bit: int, device) -> list:
     Load all teacher models specified in teacher_configs.
 
     Args:
-        teacher_configs : list of dicts with keys:
-                          {'type': str, 'ckpt_path': str, 'overrides': dict (opt)}
-        bit             : hash code length.
-        device          : torch.device.
+        teacher_configs : list of dicts:
+            {'type': 'DADH'|'UCCH', 'ckpt_path': str, 'overrides': dict}
+        bit    : hash code length.
+        device : torch.device.
 
     Returns:
-        list of callable teacher wrappers (each: x → h_real).
+        list of TeacherWrapper instances.
     """
     teachers = []
     for cfg in teacher_configs:
@@ -145,10 +161,13 @@ def load_teachers(teacher_configs: list, bit: int, device) -> list:
         if model_type not in _LOADERS:
             raise ValueError(
                 f"Unknown teacher type '{model_type}'. "
-                f"Supported: {list(_LOADERS.keys())}"
-            )
-        loader = _LOADERS[model_type]
-        teacher = loader(ckpt_path, bit, overrides, device)
+                f"Supported: {list(_LOADERS.keys())}")
+
+        if not os.path.exists(ckpt_path):
+            print(f"[teacher_loader] WARNING: checkpoint not found: {ckpt_path} — skipping.")
+            continue
+
+        teacher = _LOADERS[model_type](ckpt_path, bit, overrides, device)
         teachers.append(teacher)
         print(f"[teacher_loader] Loaded {model_type} from {ckpt_path}")
 
@@ -156,7 +175,7 @@ def load_teachers(teacher_configs: list, bit: int, device) -> list:
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Consensus target code from teachers  (for L_ME target t)
+# Consensus target code  (voting strategy from CSQ, paper Sec. III-D)
 # ──────────────────────────────────────────────────────────────────────────────
 
 @torch.no_grad()
@@ -171,6 +190,6 @@ def compute_consensus_code(teachers: list, x: torch.Tensor) -> torch.Tensor:
     agg = None
     M = len(teachers)
     for teacher in teachers:
-        h = teacher(x)  # (B, K)
+        h = teacher(x)
         agg = h if agg is None else agg + h
     return (agg / M).sign()
